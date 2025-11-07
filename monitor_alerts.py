@@ -174,6 +174,40 @@ def extract_alarm_details(ticket_subject: str, ticket_body: str):
             if key.lower() not in ['name', 'timestamp', 'period', 'statistic', 'unit', 'threshold', 'metricnamespace', 'metricname']:
                 add_dimension(key, val)
 
+    # === Format 7: Extract from alarm name if still no dimensions
+    if not dimensions and alarm_name:
+        logger.warning("No dimensions found in ticket body, attempting to extract from alarm name")
+        
+        # Try to extract instance ID from alarm name
+        instance_match = re.search(r'(i-[0-9a-f]{8,17})', alarm_name, re.IGNORECASE)
+        if instance_match:
+            add_dimension("InstanceId", instance_match.group(1))
+            logger.info(f"Extracted InstanceId from alarm name: {instance_match.group(1)}")
+        
+        # Try to extract other common dimension patterns from alarm name
+        # Pattern: ResourceType-ResourceId (e.g., "DB-mydb-1", "ALB-myalb")
+        resource_patterns = [
+            (r'(?:db|rds)[:\-\s]+([a-zA-Z0-9\-]+)', 'DBInstanceIdentifier'),
+            (r'(?:alb|loadbalancer)[:\-\s]+([a-zA-Z0-9\-/]+)', 'LoadBalancer'),
+            (r'(?:lambda|function)[:\-\s]+([a-zA-Z0-9\-_]+)', 'FunctionName'),
+            (r'(?:asg|autoscaling)[:\-\s]+([a-zA-Z0-9\-]+)', 'AutoScalingGroupName')
+        ]
+        
+        for pattern, dim_name in resource_patterns:
+            match = re.search(pattern, alarm_name, re.IGNORECASE)
+            if match and not dimensions:  # Only if we haven't found dimensions yet
+                add_dimension(dim_name, match.group(1))
+                logger.info(f"Extracted {dim_name} from alarm name: {match.group(1)}")
+                break
+
+    # === Format 8: Try to extract from ticket subject as last resort
+    if not dimensions and ticket_subject:
+        logger.warning("Still no dimensions, checking ticket subject")
+        instance_match = re.search(r'(i-[0-9a-f]{8,17})', ticket_subject, re.IGNORECASE)
+        if instance_match:
+            add_dimension("InstanceId", instance_match.group(1))
+            logger.info(f"Extracted InstanceId from ticket subject: {instance_match.group(1)}")
+
     # === Final fallback: inferred namespace
     if not namespace:
         namespace = "AWS/EC2"
@@ -265,9 +299,34 @@ def create_enhanced_metric_widget(alarm_details):
         "maximum": "Maximum",
         "samplecount": "SampleCount"
     }
-    normalized_stat = stat_mapping.get(statistic.lower(), "Average")
+    normalized_stat = stat_mapping.get(statistic.lower() if statistic else "average", "Average")
     
     logger.info(f"Building metric widget - Namespace: {namespace}, Metric: {metric_name}, Dimensions: {dimension_kv_list}, Stat: {normalized_stat}, Period: {period}")
+
+    # CRITICAL FIX: If no dimensions found, try to extract from alarm name
+    if not dimension_kv_list:
+        logger.warning(f"No dimensions found! Attempting to extract from alarm name: {alarm_name}")
+        
+        # Try to extract instance ID from alarm name (common patterns)
+        instance_patterns = [
+            r'InstanceId[:\s]+(i-[0-9a-f]{17})',  # With prefix, full length first
+            r'Instance[:\s]+(i-[0-9a-f]{17})',
+            r'(i-[0-9a-f]{17})',  # Standard full-length instance ID
+            r'(i-[0-9a-f]{8,16})'  # Shorter instance IDs (legacy)
+        ]
+        
+        for pattern in instance_patterns:
+            match = re.search(pattern, alarm_name, re.IGNORECASE)
+            if match:
+                instance_id = match.group(1)
+                dimension_kv_list = ["InstanceId", instance_id]
+                logger.info(f"Extracted InstanceId from alarm name: {instance_id}")
+                break
+        
+        # If still no dimensions and it's EC2, we need to fail gracefully
+        if not dimension_kv_list and namespace == "AWS/EC2":
+            logger.error("Cannot create widget without dimensions for EC2 metrics")
+            raise ValueError("Missing required dimensions for EC2 metric. Cannot identify which instance to monitor.")
 
     # Build metrics array with proper structure
     # Format: [[namespace, metric_name, dim_name1, dim_value1, dim_name2, dim_value2, ..., {"stat": "Average"}]]
@@ -279,6 +338,12 @@ def create_enhanced_metric_widget(alarm_details):
     for dim in dimensions:
         if isinstance(dim, dict) and "name" in dim and "value" in dim:
             dim_labels.append(f"{dim['name']}: {dim['value']}")
+    
+    # If we extracted dimensions from alarm name, add them to labels
+    if not dim_labels and dimension_kv_list:
+        for i in range(0, len(dimension_kv_list), 2):
+            if i + 1 < len(dimension_kv_list):
+                dim_labels.append(f"{dimension_kv_list[i]}: {dimension_kv_list[i+1]}")
 
     # Enhanced title with resource information
     enhanced_title = f"CloudWatch Alarm: {alarm_name}"
@@ -333,12 +398,74 @@ def create_enhanced_metric_widget(alarm_details):
     logger.info(f"Generated widget JSON: {json.dumps(widget, indent=2)}")
     return json.dumps(widget)
 
+def verify_metric_data_exists(cloudwatch, namespace, metric_name, dimensions, statistic, period):
+    """Verify that metric data exists before trying to create widget"""
+    try:
+        # Convert dimensions to CloudWatch format
+        cw_dimensions = []
+        for dim in dimensions:
+            if isinstance(dim, dict) and "name" in dim and "value" in dim:
+                cw_dimensions.append({"Name": dim["name"], "Value": dim["value"]})
+        
+        logger.info(f"Verifying metric data exists - Namespace: {namespace}, Metric: {metric_name}, Dimensions: {cw_dimensions}")
+        
+        # Query for recent datapoints
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(hours=6)
+        
+        response = cloudwatch.get_metric_statistics(
+            Namespace=namespace,
+            MetricName=metric_name,
+            Dimensions=cw_dimensions,
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=period,
+            Statistics=[statistic]
+        )
+        
+        datapoints = response.get('Datapoints', [])
+        
+        if not datapoints:
+            logger.warning(f"No datapoints found for metric {namespace}/{metric_name}")
+            return False
+        
+        logger.info(f"Found {len(datapoints)} datapoints for metric")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error verifying metric data: {e}")
+        return False
+
 def get_cloudwatch_alarm_image(account_id, region, alarm_name, namespace, metric_name, 
                                dimensions, threshold=None, comparison_operator=None, 
                                statistic="Average", period=300, unit=None):
     """Get enhanced CloudWatch alarm image with beautiful styling"""
     session = assume_role(account_id)
     cloudwatch = session.client('cloudwatch', region_name=region)
+
+    # Verify metric data exists before attempting to create widget
+    if not verify_metric_data_exists(cloudwatch, namespace, metric_name, dimensions, statistic, period):
+        logger.warning("No metric data found, attempting to fetch alarm configuration directly")
+        try:
+            # Try to get dimensions from the alarm itself
+            alarm_response = cloudwatch.describe_alarms(AlarmNames=[alarm_name])
+            if alarm_response.get('MetricAlarms'):
+                alarm = alarm_response['MetricAlarms'][0]
+                alarm_dimensions = alarm.get('Dimensions', [])
+                
+                if alarm_dimensions:
+                    logger.info(f"Found dimensions from alarm: {alarm_dimensions}")
+                    # Convert to our format
+                    dimensions = [{"name": d['Name'], "value": d['Value']} for d in alarm_dimensions]
+                    namespace = alarm.get('Namespace', namespace)
+                    metric_name = alarm.get('MetricName', metric_name)
+                    statistic = alarm.get('Statistic', statistic)
+                    period = alarm.get('Period', period)
+                    threshold = alarm.get('Threshold', threshold)
+                    
+                    logger.info(f"Updated details from alarm - Namespace: {namespace}, Metric: {metric_name}, Dimensions: {dimensions}")
+        except Exception as e:
+            logger.error(f"Failed to fetch alarm configuration: {e}")
 
     alarm_details = (alarm_name, region, namespace, metric_name, dimensions, 
                     threshold, comparison_operator, statistic, period, unit)
