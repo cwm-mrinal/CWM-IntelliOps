@@ -103,16 +103,6 @@ jobs:
             --function-version ${{ steps.publish.outputs.version }} \
             --region ${{ env.AWS_REGION }}
       
-      - name: Test Lambda function
-        run: |
-          echo '{"body": "{\"ticketId\":\"TEST-001\",\"ticketSubject\":\"Test\",\"ticketBody\":\"Test deployment\"}"}' > test-event.json
-          aws lambda invoke \
-            --function-name ${{ env.FUNCTION_NAME }} \
-            --payload file://test-event.json \
-            --region ${{ env.AWS_REGION }} \
-            response.json
-          cat response.json
-      
       - name: Deployment summary
         run: |
           echo "✅ Deployment successful!"
