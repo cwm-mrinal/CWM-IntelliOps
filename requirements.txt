@@ -1,0 +1,40 @@
+# Python dependencies for Zoho Automation Lambda
+# Install with: pip install -r requirements.txt
+
+# AWS SDK
+boto3>=1.34.0
+botocore>=1.34.0
+
+# HTTP requests
+requests>=2.31.0
+
+# HTML parsing
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Fuzzy string matching
+rapidfuzz>=3.5.0
+
+# Timezone handling (Python 3.9+)
+tzdata>=2023.3
+
+# JSON handling (included in Python standard library)
+# json
+
+# HTML entities (included in Python standard library)
+# html
+
+# Regular expressions (included in Python standard library)
+# re
+
+# Logging (included in Python standard library)
+# logging
+
+# Base64 encoding (included in Python standard library)
+# base64
+
+# Date/time handling (included in Python standard library)
+# datetime
+
+# Type hints (included in Python standard library)
+# typing
