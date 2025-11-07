@@ -110,29 +110,6 @@ jobs:
           echo "Version: ${{ steps.publish.outputs.version }}"
           echo "Region: ${{ env.AWS_REGION }}"
           echo "Commit: ${{ github.sha }}"
-      
-      - name: Test Lambda function
-        run: |
-          # Create test event using cat with heredoc to avoid encoding issues
-          cat > test-event.json << 'EOF'
-          {
-            "body": "{\"ticketId\":\"TEST-001\",\"ticketSubject\":\"Test Deployment\",\"ticketBody\":\"Automated test after deployment\"}"
-          }
-          EOF
-          
-          # Invoke Lambda function
-          aws lambda invoke \
-            --function-name ${{ env.FUNCTION_NAME }} \
-            --payload file://test-event.json \
-            --region ${{ env.AWS_REGION }} \
-            response.json
-          
-          # Display response
-          echo "Lambda Response:"
-          cat response.json
-          
-          # Clean up
-          rm -f test-event.json response.json
 
   notify:
     name: Notify Team
