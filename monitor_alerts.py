@@ -257,10 +257,22 @@ def create_enhanced_metric_widget(alarm_details):
     # Get unit label
     unit_label = get_metric_unit_label(namespace, metric_name, unit)
 
-    # Build metrics array - AWS API requires EXACT format
-    # Format: [[namespace, metric_name, dim_name1, dim_value1, dim_name2, dim_value2, ...]]
-    # NO additional options or configurations in the metrics array
-    metrics = [[namespace, metric_name] + dimension_kv_list]
+    # Normalize statistic to AWS-accepted values
+    stat_mapping = {
+        "average": "Average",
+        "sum": "Sum",
+        "minimum": "Minimum",
+        "maximum": "Maximum",
+        "samplecount": "SampleCount"
+    }
+    normalized_stat = stat_mapping.get(statistic.lower(), "Average")
+    
+    logger.info(f"Building metric widget - Namespace: {namespace}, Metric: {metric_name}, Dimensions: {dimension_kv_list}, Stat: {normalized_stat}, Period: {period}")
+
+    # Build metrics array with proper structure
+    # Format: [[namespace, metric_name, dim_name1, dim_value1, dim_name2, dim_value2, ..., {"stat": "Average"}]]
+    metric_definition = [namespace, metric_name] + dimension_kv_list + [{"stat": normalized_stat}]
+    metrics = [metric_definition]
 
     # Create dimension labels for title
     dim_labels = []
@@ -274,17 +286,18 @@ def create_enhanced_metric_widget(alarm_details):
         enhanced_title += f" | {' | '.join(dim_labels[:2])}"
 
     # Create basic widget structure (AWS API compliant)
+    # Using longer time range to ensure data is visible
     widget = {
         "width": 600,
         "height": 400,
         "metrics": metrics,
         "period": period,
-        "stat": statistic.title() if statistic else "Average",  # Ensure proper case
-        "start": "-PT3H",  # Show 3 hours of data
+        "start": "-PT6H",  # Show 6 hours of data (increased from 3)
         "end": "PT0H",
         "title": enhanced_title,
         "view": "timeSeries",
-        "region": region
+        "region": region,
+        "timezone": "+0000"  # UTC timezone
     }
 
     # Add threshold annotation if threshold exists (AWS supported format)
@@ -293,7 +306,9 @@ def create_enhanced_metric_widget(alarm_details):
             "GreaterThanThreshold": ">",
             "GreaterThanOrEqualToThreshold": ">=",
             "LessThanThreshold": "<",
-            "LessThanOrEqualToThreshold": "<="
+            "LessThanOrEqualToThreshold": "<=",
+            "GreaterThanUpperThreshold": ">",
+            "LessThanLowerThreshold": "<"
         }
         
         operator_symbol = operator_symbols.get(comparison_operator, ">")
@@ -302,17 +317,20 @@ def create_enhanced_metric_widget(alarm_details):
         widget["annotations"] = {
             "horizontal": [{
                 "label": f"Alarm Threshold ({operator_symbol} {threshold} {unit_label})",
-                "value": threshold
+                "value": threshold,
+                "fill": "above" if "Greater" in comparison_operator else "below"
             }]
         }
         
-        # Add y-axis configuration
+        # Add y-axis configuration with better scaling
         widget["yAxis"] = {
             "left": {
-                "min": 0 if metric_name in ["CPUUtilization", "MemoryUtilization"] else None
+                "min": 0 if metric_name in ["CPUUtilization", "MemoryUtilization"] else None,
+                "showUnits": True
             }
         }
 
+    logger.info(f"Generated widget JSON: {json.dumps(widget, indent=2)}")
     return json.dumps(widget)
 
 def get_cloudwatch_alarm_image(account_id, region, alarm_name, namespace, metric_name, 
@@ -334,11 +352,29 @@ def get_cloudwatch_alarm_image(account_id, region, alarm_name, namespace, metric
         logger.info("Successfully fetched enhanced CloudWatch metric image.")
         return response['MetricWidgetImage']
     except Exception as e:
-        logger.error(f"Error fetching metric widget image: {e}")
-        # Fallback to simpler widget if enhanced version fails
-        simple_widget = create_simple_fallback_widget(alarm_details)
-        response = cloudwatch.get_metric_widget_image(MetricWidget=simple_widget)
-        return response['MetricWidgetImage']
+        logger.error(f"Error fetching metric widget image with enhanced widget: {e}")
+        logger.info("Attempting fallback to simpler widget...")
+        
+        try:
+            # Fallback to simpler widget if enhanced version fails
+            simple_widget = create_simple_fallback_widget(alarm_details)
+            logger.info(f"Fallback widget JSON: {simple_widget}")
+            response = cloudwatch.get_metric_widget_image(MetricWidget=simple_widget)
+            logger.info("Successfully fetched CloudWatch metric image using fallback widget.")
+            return response['MetricWidgetImage']
+        except Exception as e2:
+            logger.error(f"Error fetching metric widget image with fallback widget: {e2}")
+            
+            # Last resort: try to get data directly from the alarm
+            try:
+                logger.info("Attempting to fetch metric data directly from alarm...")
+                alarm_widget = create_alarm_based_widget(cloudwatch, alarm_name, region)
+                response = cloudwatch.get_metric_widget_image(MetricWidget=alarm_widget)
+                logger.info("Successfully fetched CloudWatch metric image using alarm-based widget.")
+                return response['MetricWidgetImage']
+            except Exception as e3:
+                logger.error(f"All attempts failed to fetch metric widget image: {e3}")
+                raise
 
 def create_simple_fallback_widget(alarm_details):
     """Create a simple fallback widget if enhanced version fails"""
@@ -350,22 +386,138 @@ def create_simple_fallback_widget(alarm_details):
         if isinstance(dim, dict) and "name" in dim and "value" in dim:
             dimension_kv_list.extend([dim["name"], dim["value"]])
 
-    # Simple AWS compliant metrics format
-    metrics = [[namespace, metric_name] + dimension_kv_list]
+    # Normalize statistic
+    stat_mapping = {
+        "average": "Average",
+        "sum": "Sum",
+        "minimum": "Minimum",
+        "maximum": "Maximum",
+        "samplecount": "SampleCount"
+    }
+    normalized_stat = stat_mapping.get(statistic.lower() if statistic else "average", "Average")
+
+    # Simple AWS compliant metrics format with stat included
+    metrics = [[namespace, metric_name] + dimension_kv_list + [{"stat": normalized_stat}]]
 
     widget = {
         "width": 600,
         "height": 400,
         "metrics": metrics,
         "period": period,
-        "start": "-PT1H",
+        "start": "-PT12H",  # Show 12 hours to ensure data visibility
         "end": "PT0H",
         "title": f"CloudWatch Alarm: {alarm_name}",
         "view": "timeSeries",
-        "region": region
+        "region": region,
+        "timezone": "+0000"
     }
+    
+    # Add threshold line if available
+    if threshold is not None:
+        widget["annotations"] = {
+            "horizontal": [{
+                "value": threshold,
+                "label": f"Threshold: {threshold}"
+            }]
+        }
 
+    logger.info(f"Fallback widget JSON: {json.dumps(widget, indent=2)}")
     return json.dumps(widget)
+
+def create_alarm_based_widget(cloudwatch, alarm_name, region):
+    """Create widget directly from alarm configuration"""
+    try:
+        # Get alarm details from CloudWatch
+        alarm_response = cloudwatch.describe_alarms(AlarmNames=[alarm_name])
+        
+        if not alarm_response.get('MetricAlarms'):
+            raise ValueError(f"Alarm {alarm_name} not found")
+        
+        alarm = alarm_response['MetricAlarms'][0]
+        
+        # Extract metric details from alarm
+        namespace = alarm.get('Namespace')
+        metric_name = alarm.get('MetricName')
+        dimensions = alarm.get('Dimensions', [])
+        statistic = alarm.get('Statistic', 'Average')
+        period = alarm.get('Period', 300)
+        threshold = alarm.get('Threshold')
+        
+        # Build dimension list
+        dimension_kv_list = []
+        for dim in dimensions:
+            dimension_kv_list.extend([dim['Name'], dim['Value']])
+        
+        # Build metrics array
+        metrics = [[namespace, metric_name] + dimension_kv_list + [{"stat": statistic}]]
+        
+        widget = {
+            "width": 600,
+            "height": 400,
+            "metrics": metrics,
+            "period": period,
+            "start": "-PT24H",  # Show 24 hours for maximum data visibility
+            "end": "PT0H",
+            "title": f"CloudWatch Alarm: {alarm_name}",
+            "view": "timeSeries",
+            "region": region,
+            "timezone": "+0000"
+        }
+        
+        # Add threshold annotation
+        if threshold is not None:
+            widget["annotations"] = {
+                "horizontal": [{
+                    "value": threshold,
+                    "label": f"Alarm Threshold: {threshold}"
+                }]
+            }
+        
+        logger.info(f"Alarm-based widget JSON: {json.dumps(widget, indent=2)}")
+        return json.dumps(widget)
+        
+    except Exception as e:
+        logger.error(f"Error creating alarm-based widget: {e}")
+        raise
+
+def verify_metric_data_exists(cloudwatch, namespace, metric_name, dimensions, statistic, period):
+    """Verify that metric data exists before generating widget"""
+    try:
+        # Build dimensions for get_metric_statistics
+        dimension_list = []
+        for dim in dimensions:
+            if isinstance(dim, dict) and "name" in dim and "value" in dim:
+                dimension_list.append({"Name": dim["name"], "Value": dim["value"]})
+        
+        # Query last 24 hours of data
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(hours=24)
+        
+        logger.info(f"Verifying metric data exists - Namespace: {namespace}, Metric: {metric_name}, Dimensions: {dimension_list}")
+        
+        response = cloudwatch.get_metric_statistics(
+            Namespace=namespace,
+            MetricName=metric_name,
+            Dimensions=dimension_list,
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=period,
+            Statistics=[statistic]
+        )
+        
+        datapoints = response.get('Datapoints', [])
+        logger.info(f"Found {len(datapoints)} datapoints for metric")
+        
+        if datapoints:
+            logger.info(f"Sample datapoint: {datapoints[0]}")
+            return True, len(datapoints)
+        else:
+            logger.warning(f"No datapoints found for metric {namespace}/{metric_name}")
+            return False, 0
+            
+    except Exception as e:
+        logger.error(f"Error verifying metric data: {e}")
+        return False, 0
 
 def lambda_handler(event, context):
     logger.info("Enhanced monitor_alerts Lambda invoked.")
@@ -401,6 +553,36 @@ def lambda_handler(event, context):
             return {"statusCode": 400, "body": json.dumps({"error": error_msg})}
 
         logger.info(f"Processing alarm with normalized statistic: {statistic}")
+        logger.info(f"Alarm details - Namespace: {namespace}, Metric: {metric_name}, Dimensions: {dimensions}, Period: {period}")
+
+        # Assume role and create CloudWatch client
+        session = assume_role(account_id)
+        cloudwatch = session.client('cloudwatch', region_name=region)
+        
+        # Verify metric data exists
+        data_exists, datapoint_count = verify_metric_data_exists(
+            cloudwatch, namespace, metric_name, dimensions, statistic, period
+        )
+        
+        if not data_exists:
+            logger.warning(f"No metric data found for alarm {alarm_name}. Will still attempt to generate widget.")
+            comment_text = (
+                f"⚠️ CloudWatch Alarm: {alarm_name}\n\n"
+                f"Note: No metric data was found in the last 24 hours for this alarm. "
+                f"This could mean:\n"
+                f"- The resource is not sending metrics\n"
+                f"- The alarm was recently created\n"
+                f"- The metric namespace/name/dimensions are incorrect\n\n"
+                f"Alarm Details:\n"
+                f"- Namespace: {namespace}\n"
+                f"- Metric: {metric_name}\n"
+                f"- Region: {region}\n"
+                f"- Threshold: {threshold}\n"
+                f"- Statistic: {statistic}"
+            )
+        else:
+            logger.info(f"Metric data verified: {datapoint_count} datapoints found")
+            comment_text = f"📊 CloudWatch Alarm Dashboard for '{alarm_name}' (Region: {region})\n\nShowing {datapoint_count} datapoints from the last 24 hours."
 
         # Get enhanced image with all styling and threshold information
         image_bytes = get_cloudwatch_alarm_image(
@@ -408,8 +590,6 @@ def lambda_handler(event, context):
             threshold, comparison_operator, statistic, period, unit
         )
         image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-
-        comment_text = f"Private Comment: Attached CloudWatch Alarm Screenshot for alarm '{alarm_name}' in region {region}." 
 
         zoho_response = add_private_comment_with_attachment(
             ticket_id=ticket_id,
@@ -425,12 +605,15 @@ def lambda_handler(event, context):
             "body": json.dumps({
                 "message": "Successfully added enhanced CloudWatch alarm dashboard as private comment",
                 "ticketId": ticket_id,
+                "datapoints_found": datapoint_count,
+                "data_exists": data_exists,
                 "features": [
                     "Enhanced visual styling",
                     "Threshold indicators",
-                    "3-hour data view",
+                    "Extended time range (6-24 hours)",
                     "AWS-compliant formatting",
-                    "Professional annotations"
+                    "Professional annotations",
+                    "Data verification"
                 ]
             }),
         }
