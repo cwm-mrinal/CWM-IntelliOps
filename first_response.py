@@ -105,7 +105,7 @@ def send_email_reply(ticket_id, from_emails, to_emails, cc_emails, reply_text):
     support_email = "support@cloudworkmates.com"
 
     # Set CC to include both email addresses
-    cc_email = "advait.s@cloudworkmates.com,kavya.y@cloudworkmates.com"
+    cc_email = "vikas.n@cloudworkmates.com,kavya.y@cloudworkmates.com"
 
     # Process multiple recipients in the 'to' field from from_emails
     to_recipients = ",".join([extract_email(email) for email in from_emails])
